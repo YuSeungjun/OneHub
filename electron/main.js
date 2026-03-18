@@ -18,8 +18,8 @@ function startPythonBackend() {
         args = [];
     } else {
         const scriptPath = path.join(__dirname, '../backend/main.py');
-        command = 'C:\\Users\\user\\anaconda3\\Scripts\\conda.exe';
-        args = ['run', '-n', 'onehub', 'python', scriptPath];
+        command = 'python';
+        args = [scriptPath];
     }
 
     pythonProcess = spawn(command, args, { shell: !app.isPackaged });

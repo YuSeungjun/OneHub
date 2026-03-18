@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+yt-dlp
+imageio-ffmpeg
+pywin32
+python-multipart
+pyinstaller

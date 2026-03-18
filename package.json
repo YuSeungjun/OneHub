@@ -7,7 +7,7 @@
     "dev:vite": "vite",
     "dev:electron": "wait-on http://localhost:5173 && electron .",
     "dev": "concurrently \"npm run dev:vite\" \"npm run dev:electron\"",
-    "build:backend": "C:\\Users\\user\\anaconda3\\Scripts\\conda.exe run -n onehub pyinstaller --noconfirm --distpath ./backend/dist main.spec",
+    "build:backend": "pyinstaller --noconfirm --distpath ./backend/dist main.spec",
     "build": "vite build && electron-builder",
     "lint": "eslint .",
     "preview": "vite preview"
