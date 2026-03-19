@@ -1,6 +1,13 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
-const { spawn, exec, execSync } = require('child_process');
+const fs = require('fs');
+const { spawn, execFile } = require('child_process');
+
+const logFile = path.join(app.getPath('userData'), 'onehub_debug.log');
+function log(msg) {
+    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    try { fs.appendFileSync(logFile, line); } catch (_) {}
+}
 
 // 앱 중복 실행 방지 — 이미 실행 중이면 기존 창을 포커스
 const gotTheLock = app.requestSingleInstanceLock();
@@ -10,32 +17,61 @@ if (!gotTheLock) {
 
 let pythonProcess = null;
 
+const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+
+function killProcess(name) {
+    try {
+        execFile(taskkillPath, ['/F', '/IM', name], { stdio: 'ignore' });
+    } catch (_) {}
+}
+
 function startPythonBackend() {
     let command;
     let args;
+    let cwd;
 
-    // 이전 main.exe가 남아있으면 확실히 죽이고 시작
+    // 이전 백엔드가 남아있으면 확실히 죽이고 시작
     if (process.platform === 'win32') {
-        try { execSync('taskkill /F /IM main.exe', { stdio: 'ignore' }); } catch (_) {}
+        killProcess('onehub_backend.exe');
     }
 
     if (app.isPackaged) {
-        command = path.join(process.resourcesPath, 'backend', 'main.exe');
+        command = path.join(process.resourcesPath, 'backend', 'onehub_backend.exe');
         args = [];
+        cwd = app.getPath('userData');
     } else {
-        const scriptPath = path.join(__dirname, '../backend/main.py');
-        command = 'python';
-        args = [scriptPath];
+        const projectRoot = path.join(__dirname, '..');
+        command = process.platform === 'win32' ? 'uv.cmd' : 'uv';
+        args = ['run', 'python', path.join(projectRoot, 'backend', 'main.py')];
+        cwd = projectRoot;
     }
 
-    pythonProcess = spawn(command, args, { shell: false });
+    log(`Spawning backend: command=${command} args=${JSON.stringify(args)} cwd=${cwd}`);
+    log(`Command exists: ${fs.existsSync(command)}`);
+
+    const shell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
+    log(`Using shell: ${shell}, exists: ${fs.existsSync(shell)}`);
+
+    pythonProcess = spawn(command, args, {
+        cwd: cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: shell,
+    });
 
     pythonProcess.stdout.on('data', (data) => {
-        console.log(`Backend stdout: ${data}`);
+        log(`stdout: ${data}`);
     });
 
     pythonProcess.stderr.on('data', (data) => {
-        console.error(`Backend stderr: ${data}`);
+        log(`stderr: ${data}`);
+    });
+
+    pythonProcess.on('error', (err) => {
+        log(`Spawn error: ${err.message}`);
+    });
+
+    pythonProcess.on('exit', (code, signal) => {
+        log(`Backend exited: code=${code} signal=${signal}`);
     });
 }
 
@@ -96,8 +132,8 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
     if (pythonProcess) {
         if (process.platform === 'win32') {
-            exec(`taskkill /F /T /PID ${pythonProcess.pid}`);
-            exec('taskkill /F /IM main.exe');
+            execFile(taskkillPath, ['/F', '/T', '/PID', String(pythonProcess.pid)], { stdio: 'ignore' });
+            killProcess('onehub_backend.exe');
         } else {
             pythonProcess.kill();
         }
