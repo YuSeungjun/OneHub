@@ -231,7 +231,7 @@ async def convert_document(file: UploadFile = File(...), direction: str = Form(.
 
             # Open 후 내용 확인
             text_check = hwp.GetTextFile("TEXT", "")
-            if len(text_check.strip()) == 0:
+            if text_check is None or len(text_check.strip()) == 0:
                 hwp.Clear(1)
                 hwp.Quit()
                 hwp = None

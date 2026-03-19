@@ -32,6 +32,19 @@ function App() {
     initPath();
   }, []);
 
+  // 백엔드가 아직 안 떴으면 자동 재시도 (최대 15초)
+  const fetchWithRetry = async (url, options, retries = 10) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await fetch(url, options);
+      } catch (err) {
+        if (err.name === 'AbortError') throw err;
+        if (i === retries - 1) throw err;
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+  };
+
   const handleCancel = async () => {
     cancelledRef.current = true;
     // 1. 프론트엔드 fetch 요청 중단
@@ -63,7 +76,7 @@ function App() {
     abortControllerRef.current = new AbortController();
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/media/download', {
+      const response = await fetchWithRetry('http://127.0.0.1:8000/media/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, format, resolution, download_path: downloadPath }),
@@ -108,7 +121,7 @@ function App() {
       formData.append('direction', direction);
       formData.append('save_path', downloadPath || '');
 
-      const response = await fetch('http://127.0.0.1:8000/doc/convert', {
+      const response = await fetchWithRetry('http://127.0.0.1:8000/doc/convert', {
         method: 'POST',
         body: formData,
         signal: abortControllerRef.current.signal

@@ -1,6 +1,12 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
-const { spawn, exec } = require('child_process');
+const { spawn, exec, execSync } = require('child_process');
+
+// 앱 중복 실행 방지 — 이미 실행 중이면 기존 창을 포커스
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+    app.quit();
+}
 
 let pythonProcess = null;
 
@@ -8,9 +14,9 @@ function startPythonBackend() {
     let command;
     let args;
 
-    // 포트가 사용 중일 가능성을 대비하여 시작 전에 프로세스 킬 시도
+    // 이전 main.exe가 남아있으면 확실히 죽이고 시작
     if (process.platform === 'win32') {
-        exec('for /f "tokens=5" %a in (\'netstat -aon ^| findstr :8000\') do taskkill /F /PID %a', () => { });
+        try { execSync('taskkill /F /IM main.exe', { stdio: 'ignore' }); } catch (_) {}
     }
 
     if (app.isPackaged) {
@@ -22,7 +28,7 @@ function startPythonBackend() {
         args = [scriptPath];
     }
 
-    pythonProcess = spawn(command, args, { shell: !app.isPackaged });
+    pythonProcess = spawn(command, args, { shell: false });
 
     pythonProcess.stdout.on('data', (data) => {
         console.log(`Backend stdout: ${data}`);
@@ -68,6 +74,15 @@ app.whenReady().then(() => {
         return app.getPath('downloads');
     });
 
+    // 두 번째 인스턴스가 실행되면 기존 창을 포커스
+    app.on('second-instance', () => {
+        const windows = BrowserWindow.getAllWindows();
+        if (windows.length > 0) {
+            if (windows[0].isMinimized()) windows[0].restore();
+            windows[0].focus();
+        }
+    });
+
     startPythonBackend();
     createWindow();
 
@@ -82,6 +97,7 @@ app.on('will-quit', () => {
     if (pythonProcess) {
         if (process.platform === 'win32') {
             exec(`taskkill /F /T /PID ${pythonProcess.pid}`);
+            exec('taskkill /F /IM main.exe');
         } else {
             pythonProcess.kill();
         }
