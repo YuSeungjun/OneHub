@@ -52,12 +52,17 @@
       {
         "from": "dist/onehub_backend.exe",
         "to": "backend/onehub_backend.exe",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "renderer",
         "to": "renderer",
-        "filter": ["**/*", "!**/*.map"]
+        "filter": [
+          "**/*",
+          "!**/*.map"
+        ]
       }
     ]
   },

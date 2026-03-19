@@ -540,4 +540,22 @@ async def convert_document(file: UploadFile = File(...), direction: str = Form(.
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    import socket
+
+    port = 8000
+
+    # 포트가 이미 사용 중인지 확인 후 시작
+    def _port_in_use(p):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('127.0.0.1', p)) == 0
+
+    if _port_in_use(port):
+        print(f"[OneHub] Port {port} is already in use, waiting 3s and retrying...")
+        import time
+        time.sleep(3)
+        if _port_in_use(port):
+            print(f"[OneHub] Port {port} still in use. Exiting.")
+            sys.exit(1)
+
+    print(f"[OneHub] Starting backend on port {port}")
+    uvicorn.run(app, host="127.0.0.1", port=port)

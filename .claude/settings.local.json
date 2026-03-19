@@ -82,7 +82,10 @@
       "Bash(cmd //c \"taskkill /F /IM electron.exe\")",
       "Bash(cmd //c \"taskkill /F /PID 8316\")",
       "Bash(cmd //c \"taskkill /F /IM onehub_backend.exe\")",
-      "Bash(\"C:/Users/user/AppData/Local/Programs/OneHub/resources/backend/onehub_backend.exe\" 2>&1)"
+      "Bash(\"C:/Users/user/AppData/Local/Programs/OneHub/resources/backend/onehub_backend.exe\" 2>&1)",
+      "Read(//c/Users/user/Desktop/code/OneHub/Local/OneHub/**)",
+      "Read(//c/Users/user/Desktop/code/OneHub/$USERPROFILE/AppData/Local/OneHub/**)",
+      "Bash(tasklist)"
     ]
   }
 }
