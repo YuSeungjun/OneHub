@@ -8,6 +8,7 @@ import './index.css';
 function App() {
   const [activeMode, setActiveMode] = useState('media'); // 'media' or 'doc'
   const [lang, setLang] = useState('ko');
+  const [platform] = useState(() => window.electronAPI?.platform || 'win32');
   const t = translations[lang];
   const [status, setStatus] = useState(t.ready);
   const [progress, setProgress] = useState(0);
@@ -212,7 +213,7 @@ function App() {
               <FileText style={{ display: 'inline-block', marginRight: '8px', verticalAlign: 'middle' }} size={32} />
               {t.docHubTitle}
             </h1>
-            <p className="hub-subtitle">{t.docHubSub}</p>
+            <p className="hub-subtitle">{platform === 'darwin' ? t.docHubSubMac : t.docHubSub}</p>
           </div>
           <DocHub
             onConvert={handleDocConvert}
@@ -220,6 +221,7 @@ function App() {
             downloadPath={downloadPath}
             isProcessing={activeMode === 'doc' && isProcessing}
             onCancel={handleCancel}
+            platform={platform}
             onSelectPath={async () => {
               if (window.electronAPI && window.electronAPI.selectFolder) {
                 const folderPath = await window.electronAPI.selectFolder();

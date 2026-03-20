@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { UploadCloud, FileText, FileImage, ArrowRight, XCircle } from 'lucide-react';
 
-export default function DocHub({ onConvert, t, downloadPath, onSelectPath, isProcessing, onCancel }) {
+export default function DocHub({ onConvert, t, downloadPath, onSelectPath, isProcessing, onCancel, platform }) {
     const [file, setFile] = useState(null);
+    const isMac = platform === 'darwin';
     const [direction, setDirection] = useState('HWP_TO_WORD'); // HWP_TO_WORD or WORD_TO_HWP
     const [isDragging, setIsDragging] = useState(false);
 
@@ -33,6 +34,7 @@ export default function DocHub({ onConvert, t, downloadPath, onSelectPath, isPro
     return (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', marginTop: '0.5rem', overflowY: 'auto', paddingRight: '4px' }}>
 
+            {!isMac && (
             <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', marginBottom: '1rem' }}>
                 <div
                     onClick={() => setDirection('HWP_TO_WORD')}
@@ -57,6 +59,7 @@ export default function DocHub({ onConvert, t, downloadPath, onSelectPath, isPro
                     <FileText size={18} /> Word <ArrowRight size={14} /> HWP
                 </div>
             </div>
+            )}
 
             <div
                 onDragOver={handleDragOver}
@@ -84,7 +87,7 @@ export default function DocHub({ onConvert, t, downloadPath, onSelectPath, isPro
                     type="file"
                     style={{ display: 'none' }}
                     onChange={(e) => e.target.files && setFile(e.target.files[0])}
-                    accept={direction === 'HWP_TO_WORD' ? '.hwp,.hwpx' : '.doc,.docx'}
+                    accept={isMac || direction === 'HWP_TO_WORD' ? '.hwp,.hwpx' : '.doc,.docx'}
                 />
             </div>
 

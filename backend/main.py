@@ -106,16 +106,26 @@ def _cleanup_dir(download_dir):
 
 def _kill_ffmpeg():
     """ffmpeg/ffprobe 프로세스를 강제 종료합니다 (후처리 단계 중단용)."""
-    CREATE_NO_WINDOW = 0x08000000
-    for name in ['ffmpeg.exe', 'ffprobe.exe']:
-        try:
-            subprocess.run(
-                ['taskkill', '/F', '/IM', name],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW
-            )
-        except:
-            pass
+    if _IS_WINDOWS:
+        CREATE_NO_WINDOW = 0x08000000
+        for name in ['ffmpeg.exe', 'ffprobe.exe']:
+            try:
+                subprocess.run(
+                    ['taskkill', '/F', '/IM', name],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW
+                )
+            except:
+                pass
+    else:
+        for name in ['ffmpeg', 'ffprobe']:
+            try:
+                subprocess.run(
+                    ['pkill', '-f', name],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except:
+                pass
 
 def _run_download(ydl_opts, url, result_q):
     """스레드에서 실행: yt-dlp 다운로드"""
@@ -149,7 +159,7 @@ def download_media(req: DownloadRequest):
         'outtmpl': os.path.join(downloads_path, '%(title).200s.%(ext)s'),
         'quiet': False,
         'ffmpeg_location': _get_ffmpeg_path(),
-        'windowsfilenames': True,
+        'windowsfilenames': _IS_WINDOWS,
         'restrictfilenames': True,
         'trim_file_name': 200,
         'progress_hooks': [cancel_hook],
@@ -165,8 +175,25 @@ def download_media(req: DownloadRequest):
     else:
         res_map = {'4K': '2160', '1080p': '1080', '720p': '720'}
         target_res = res_map.get(req.resolution, '1080')
-        ydl_opts['format'] = f'bestvideo[ext=mp4][height<={target_res}]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        ydl_opts['format'] = (
+            f'bestvideo[ext=mp4][vcodec^=avc1][height<={target_res}]+bestaudio[ext=m4a][acodec^=mp4a]/'
+            f'bestvideo[ext=mp4][vcodec^=avc1][height<={target_res}]+bestaudio[ext=m4a]/'
+            f'bestvideo[ext=mp4][height<={target_res}]+bestaudio[ext=m4a]/'
+            f'best[ext=mp4]/best'
+        )
         ydl_opts['merge_output_format'] = 'mp4'
+        # QuickTime 호환: H.264+AAC로 재인코딩 보장
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }]
+        ydl_opts['postprocessor_args'] = {
+            'videoconvertor': [
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-movflags', '+faststart',
+            ],
+        }
 
     result_q = queue.Queue()
     dl_thread = threading.Thread(target=_run_download, args=(ydl_opts, req.url, result_q), daemon=True)
@@ -197,8 +224,15 @@ def cancel_media_download():
     _kill_ffmpeg()
     return {"status": "success", "message": "Cancel signal sent"}
 
-import win32com.client as win32
-import pythoncom
+import platform as _platform_mod
+_IS_WINDOWS = _platform_mod.system() == 'Windows'
+if _IS_WINDOWS:
+    import win32com.client as win32
+    import pythoncom
+else:
+    from hwp5.xmlmodel import Hwp5File
+    from docx import Document as DocxDocument
+    import olefile
 
 from fastapi import File, UploadFile, Form
 
@@ -400,8 +434,268 @@ def _docx_to_html(docx_path):
     return html_path
 
 
+def _extract_bindata_images(hwp_path):
+    """HWP OLE에서 BinData 이미지 추출 → {storage_id_int: BytesIO}"""
+    import io, zlib
+    images = {}
+    try:
+        ole = olefile.OleFileIO(hwp_path)
+        for entry in ole.listdir():
+            if entry[0] == 'BinData' and len(entry) > 1:
+                name = entry[1]  # e.g. "BIN0001.png"
+                digits = ''.join(c for c in name.split('.')[0] if c.isdigit())
+                if not digits:
+                    continue
+                num = int(digits)
+                data = ole.openstream('/'.join(entry)).read()
+                try:
+                    data = zlib.decompress(data, -15)
+                except Exception:
+                    pass
+                # 이미지 포맷 검증
+                if (data[:8] == b'\x89PNG\r\n\x1a\n' or data[:2] == b'\xff\xd8'
+                        or data[:4] == b'GIF8' or data[:2] == b'BM'):
+                    images[num] = io.BytesIO(data)
+        ole.close()
+    except Exception:
+        pass
+    return images
+
+
+def _hwp_process_paragraph(doc, para_elem, image_cache, ns):
+    """XML Paragraph 요소를 순회하며 docx paragraph에 텍스트+이미지 삽입"""
+    from docx.shared import Emu
+    HWPUNIT_PER_INCH = 7200
+
+    paragraph = doc.add_paragraph()
+    # LineSeg가 있으면 그 안의 자식을 순회, 없으면 직접 자식 순회
+    containers = para_elem.findall('LineSeg')
+    if not containers:
+        containers = [para_elem]
+
+    for container in containers:
+        for child in container:
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+
+            if tag == 'Text':
+                text = child.text or ''
+                if text:
+                    paragraph.add_run(text)
+
+            elif tag == 'ControlChar':
+                name = child.get('name', '')
+                if name == 'LINE_BREAK':
+                    paragraph.add_run('\n')
+
+            elif tag == 'GShapeObjectControl':
+                # ShapePicture → PictureInfo/@bindata-id 찾기
+                pic_info = child.find('.//PictureInfo')
+                if pic_info is None:
+                    continue
+                bid_str = pic_info.get('bindata-id', '0')
+                try:
+                    bid = int(bid_str)
+                except ValueError:
+                    continue
+                if bid <= 0 or bid not in image_cache:
+                    continue
+
+                # 크기 정보 (ShapeComponent의 width)
+                shape_comp = child.find('.//ShapeComponent')
+                width_hwp = 0
+                if shape_comp is not None:
+                    try:
+                        width_hwp = int(shape_comp.get('width', '0'))
+                    except ValueError:
+                        pass
+
+                if width_hwp > 0:
+                    width_emu = int(width_hwp * 914400 / HWPUNIT_PER_INCH)
+                else:
+                    width_emu = int(5.5 * 914400)  # 기본 5.5 inches
+
+                img = image_cache[bid]
+                img.seek(0)
+                try:
+                    run = paragraph.add_run()
+                    run.add_picture(img, width=Emu(width_emu))
+                except Exception:
+                    pass
+
+            elif tag == 'TableControl':
+                _hwp_process_table(doc, child, image_cache, ns)
+
+    return paragraph
+
+
+def _hwp_process_table(doc, table_elem, image_cache, ns):
+    """XML TableControl 요소를 docx 테이블로 변환"""
+    table_body = table_elem.find('.//TableBody')
+    if table_body is None:
+        return
+    rows = table_body.findall('TableRow')
+    if not rows:
+        return
+    first_cells = rows[0].findall('TableCell')
+    num_cols = max(len(first_cells), 1)
+    table = doc.add_table(rows=len(rows), cols=num_cols)
+    for row_idx, row_elem in enumerate(rows):
+        cells = row_elem.findall('TableCell')
+        for col_idx, cell_elem in enumerate(cells):
+            if col_idx >= num_cols:
+                break
+            cell = table.cell(row_idx, col_idx)
+            paras = cell_elem.findall('Paragraph')
+            for i, cp in enumerate(paras):
+                if i == 0 and cell.paragraphs:
+                    # 기존 빈 paragraph에 내용 추가
+                    _hwp_fill_paragraph(cell.paragraphs[0], cp, image_cache, ns)
+                else:
+                    _hwp_process_paragraph_into_cell(cell, cp, image_cache, ns)
+
+
+def _hwp_fill_paragraph(paragraph, para_elem, image_cache, ns):
+    """기존 paragraph에 XML 내용 채우기"""
+    from docx.shared import Emu
+    HWPUNIT_PER_INCH = 7200
+    containers = para_elem.findall('LineSeg')
+    if not containers:
+        containers = [para_elem]
+    for container in containers:
+        for child in container:
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag == 'Text':
+                text = child.text or ''
+                if text:
+                    paragraph.add_run(text)
+            elif tag == 'GShapeObjectControl':
+                pic_info = child.find('.//PictureInfo')
+                if pic_info is None:
+                    continue
+                try:
+                    bid = int(pic_info.get('bindata-id', '0'))
+                except ValueError:
+                    continue
+                if bid <= 0 or bid not in image_cache:
+                    continue
+                shape_comp = child.find('.//ShapeComponent')
+                width_hwp = 0
+                if shape_comp is not None:
+                    try:
+                        width_hwp = int(shape_comp.get('width', '0'))
+                    except ValueError:
+                        pass
+                width_emu = int(width_hwp * 914400 / HWPUNIT_PER_INCH) if width_hwp > 0 else int(5.5 * 914400)
+                img = image_cache[bid]
+                img.seek(0)
+                try:
+                    run = paragraph.add_run()
+                    run.add_picture(img, width=Emu(width_emu))
+                except Exception:
+                    pass
+
+
+def _hwp_process_paragraph_into_cell(cell, para_elem, image_cache, ns):
+    """cell에 새 paragraph 추가 후 내용 채우기"""
+    p = cell.add_paragraph()
+    _hwp_fill_paragraph(p, para_elem, image_cache, ns)
+
+
+def _hwp_to_docx_mac(input_path, output_path):
+    """macOS: hwp5 XML 모델 기반 HWP→DOCX 변환 (이미지 원본 위치 매핑)"""
+    import io
+    from contextlib import closing
+    from hwp5.xmlmodel import Hwp5File
+    from xml.etree import ElementTree as ET
+
+    # 1. BinData 이미지 추출 (olefile)
+    image_cache = _extract_bindata_images(input_path)
+
+    try:
+        # 2. hwp5 XML 생성 + 파싱
+        with closing(Hwp5File(input_path)) as hwp5file:
+            xml_buf = io.BytesIO()
+            hwp5file.xmlevents().dump(xml_buf)
+            xml_buf.seek(0)
+
+        tree = ET.parse(xml_buf)
+        root = tree.getroot()
+
+        # 3. XML 순회하며 DOCX 생성
+        doc = DocxDocument()
+
+        # 부모 맵 구축 (테이블 셀 내부 Paragraph 필터링용)
+        parent_map = {c: p for p in root.iter() for c in p}
+
+        # BodyText 내 모든 Paragraph를 순서대로 처리
+        # 단, TableCell 내부 Paragraph는 _hwp_process_table에서 처리하므로 건너뜀
+        body_text = root.find('.//BodyText')
+        if body_text is None:
+            body_text = root
+
+        def _walk_elements(container):
+            """재귀적으로 Paragraph와 TableControl을 찾아 처리"""
+            for child in container:
+                tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                if tag == 'Paragraph':
+                    _hwp_process_paragraph(doc, child, image_cache, None)
+                elif tag == 'TableControl':
+                    _hwp_process_table(doc, child, image_cache, None)
+                elif tag in ('SectionDef', 'ColumnSet', 'Column'):
+                    # 중간 컨테이너는 재귀 탐색
+                    _walk_elements(child)
+
+        _walk_elements(body_text)
+
+        doc.save(output_path)
+
+    except Exception:
+        # XML 파싱 실패 시 fallback: 텍스트만 추출
+        _hwp_to_docx_mac_fallback(input_path, output_path, image_cache)
+
+
+
+def _hwp_to_docx_mac_fallback(input_path, output_path, image_cache):
+    """Fallback: hwp5txt로 텍스트 추출 + 이미지 끝에 추가"""
+    import io
+    from contextlib import closing
+    from hwp5.hwp5txt import Hwp5File, TextTransform
+    from docx.shared import Inches
+
+    text_transform = TextTransform()
+    buf = io.BytesIO()
+    with closing(Hwp5File(input_path)) as hwp5file:
+        text_transform.transform_hwp5_to_text(hwp5file, buf)
+    text = buf.getvalue().decode('utf-8', errors='replace')
+
+    doc = DocxDocument()
+    for line in text.splitlines():
+        doc.add_paragraph(line)
+    if image_cache:
+        for img in image_cache.values():
+            img.seek(0)
+            try:
+                doc.add_picture(img, width=Inches(5.5))
+            except Exception:
+                pass
+    doc.save(output_path)
+
+
 def _hwp_convert_worker(input_path, output_path, direction, save_fmt, result_q):
-    """별도 스레드에서 HWP COM 변환 (STA 보장)"""
+    """별도 스레드에서 HWP 변환 (Windows: COM, macOS: pyhwp)"""
+    if not _IS_WINDOWS:
+        # macOS
+        if direction == 'WORD_TO_HWP':
+            result_q.put({"status": "error", "message": "Word→HWP conversion is not supported on macOS."})
+            return
+        try:
+            _hwp_to_docx_mac(input_path, output_path)
+            result_q.put({"status": "success", "method": "pyhwp"})
+        except Exception as e:
+            result_q.put({"status": "error", "message": str(e)})
+        return
+
+    # Windows: COM 자동화
     pythoncom.CoInitialize()
     hwp = None
     html_path = None
@@ -414,10 +708,8 @@ def _hwp_convert_worker(input_path, output_path, direction, save_fmt, result_q):
         used_method = ""
 
         if direction == 'WORD_TO_HWP':
-            # 1차: OOXML 직접 열기 시도 (한글 2020+ 에서 동작)
             r = hwp.Open(input_path, "OOXML", "")
             if r:
-                # 내용 검증 — 바이너리가 텍스트로 열린 경우 걸러냄
                 text = hwp.GetTextFile("TEXT", "")
                 if text and not text.startswith("PK"):
                     open_ok = True
@@ -425,7 +717,6 @@ def _hwp_convert_worker(input_path, output_path, direction, save_fmt, result_q):
                 else:
                     hwp.Clear(1)
 
-            # 2차: HTML 변환 후 열기 (한글 2020 미만)
             if not open_ok:
                 html_path = _docx_to_html(input_path)
                 for fmt in ["HTML", ""]:
@@ -435,7 +726,6 @@ def _hwp_convert_worker(input_path, output_path, direction, save_fmt, result_q):
                         used_method = "html"
                         break
         else:
-            # HWP_TO_WORD: HWP 파일은 직접 열기
             for fmt in ["HWP", ""]:
                 r = hwp.Open(input_path, fmt, "")
                 if r:
@@ -446,7 +736,6 @@ def _hwp_convert_worker(input_path, output_path, direction, save_fmt, result_q):
             result_q.put({"status": "error", "message": "파일 열기 실패"})
             return
 
-        # 저장
         hwp.HAction.GetDefault("FileSaveAs_S", hwp.HParameterSet.HFileOpenSave.HSet)
         hwp.HParameterSet.HFileOpenSave.filename = output_path
         hwp.HParameterSet.HFileOpenSave.Format = save_fmt
@@ -490,6 +779,9 @@ async def convert_document(file: UploadFile = File(...), direction: str = Form(.
             buffer.write(await file.read())
 
         file_path = os.path.abspath(file_path)
+
+        if not _IS_WINDOWS and direction == 'WORD_TO_HWP':
+            return {"status": "error", "message": "Word→HWP conversion is not supported on macOS."}
 
         output_dir = save_path if save_path else str(Path.home() / "Downloads")
         os.makedirs(output_dir, exist_ok=True)

@@ -29,34 +29,47 @@ let pythonProcess = null;
 let backendStopping = false;  // 앱 종료 중 재시작 방지
 
 const BACKEND_PORT = 8000;
-const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+const isWin = process.platform === 'win32';
 
 function killProcess(name) {
     try {
-        execFileSync(taskkillPath, ['/F', '/IM', name], { stdio: 'ignore' });
+        if (isWin) {
+            const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+            execFileSync(taskkillPath, ['/F', '/IM', name], { stdio: 'ignore' });
+        } else {
+            execFileSync('pkill', ['-f', name], { stdio: 'ignore' });
+        }
     } catch (_) {}
 }
 
 /** 포트 8000을 점유 중인 프로세스를 찾아서 죽인다 */
 function killPortHolder(port) {
-    if (process.platform !== 'win32') return;
     try {
-        const result = execFileSync('netstat', ['-ano'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
-        const lines = result.split('\n');
-        const pids = new Set();
-        for (const line of lines) {
-            // 127.0.0.1:8000 또는 0.0.0.0:8000 LISTENING 상태인 PID 수집
-            if (line.includes(`:${port}`) && line.includes('LISTENING')) {
-                const parts = line.trim().split(/\s+/);
-                const pid = parts[parts.length - 1];
-                if (pid && pid !== '0') pids.add(pid);
+        if (isWin) {
+            const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+            const result = execFileSync('netstat', ['-ano'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
+            const lines = result.split('\n');
+            const pids = new Set();
+            for (const line of lines) {
+                if (line.includes(`:${port}`) && line.includes('LISTENING')) {
+                    const parts = line.trim().split(/\s+/);
+                    const pid = parts[parts.length - 1];
+                    if (pid && pid !== '0') pids.add(pid);
+                }
             }
-        }
-        for (const pid of pids) {
-            log(`Killing PID ${pid} holding port ${port}`);
-            try {
-                execFileSync(taskkillPath, ['/F', '/T', '/PID', pid], { stdio: 'ignore' });
-            } catch (_) {}
+            for (const pid of pids) {
+                log(`Killing PID ${pid} holding port ${port}`);
+                try {
+                    execFileSync(taskkillPath, ['/F', '/T', '/PID', pid], { stdio: 'ignore' });
+                } catch (_) {}
+            }
+        } else {
+            const result = execFileSync('lsof', ['-ti', `:${port}`], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
+            const pids = result.trim().split('\n').filter(Boolean);
+            for (const pid of pids) {
+                log(`Killing PID ${pid} holding port ${port}`);
+                try { process.kill(Number(pid), 'SIGKILL'); } catch (_) {}
+            }
         }
     } catch (e) {
         log(`killPortHolder error: ${e.message}`);
@@ -84,22 +97,21 @@ function startPythonBackend() {
     let useShell = false;
 
     // 이전 백엔드가 남아있으면 확실히 죽이고 시작
-    if (process.platform === 'win32') {
-        killProcess('onehub_backend.exe');
-        killPortHolder(BACKEND_PORT);
-    }
+    const binaryName = isWin ? 'onehub_backend.exe' : 'onehub_backend';
+    killProcess(binaryName);
+    killPortHolder(BACKEND_PORT);
 
     if (app.isPackaged) {
-        command = path.join(process.resourcesPath, 'backend', 'onehub_backend.exe');
+        command = path.join(process.resourcesPath, 'backend', binaryName);
         args = [];
         cwd = app.getPath('userData');
-        useShell = false;  // 패키지된 exe는 shell 불필요
+        useShell = false;
     } else {
         const projectRoot = path.join(__dirname, '..');
-        command = process.platform === 'win32' ? 'uv.cmd' : 'uv';
+        command = isWin ? 'uv.cmd' : 'uv';
         args = ['run', 'python', path.join(projectRoot, 'backend', 'main.py')];
         cwd = projectRoot;
-        useShell = true;  // .cmd 파일은 shell 필요
+        useShell = isWin;  // Windows: .cmd 파일은 shell 필요, macOS: 불필요
     }
 
     // cwd가 없으면 생성
@@ -113,7 +125,9 @@ function startPythonBackend() {
         stdio: ['pipe', 'pipe', 'pipe'],
     };
     if (useShell) {
-        spawnOpts.shell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
+        spawnOpts.shell = isWin
+            ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
+            : true;
     }
 
     pythonProcess = spawn(command, args, spawnOpts);
@@ -219,12 +233,14 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
     backendStopping = true;  // 재시작 방지
     if (pythonProcess) {
-        if (process.platform === 'win32') {
+        if (isWin) {
+            const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
             try { execFileSync(taskkillPath, ['/F', '/T', '/PID', String(pythonProcess.pid)], { stdio: 'ignore' }); } catch (_) {}
-            killProcess('onehub_backend.exe');
         } else {
-            pythonProcess.kill();
+            pythonProcess.kill('SIGTERM');
         }
+        const binaryName = isWin ? 'onehub_backend.exe' : 'onehub_backend';
+        killProcess(binaryName);
         pythonProcess = null;
     }
 });

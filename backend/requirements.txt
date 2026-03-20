@@ -1,8 +1,14 @@
+# Requires Python >= 3.13
 fastapi
 uvicorn
 pydantic
 yt-dlp
 imageio-ffmpeg
-pywin32
 python-multipart
 pyinstaller
+six
+pywin32; sys_platform == "win32"
+pyhwp; sys_platform == "darwin"
+python-docx; sys_platform == "darwin"
+olefile; sys_platform == "darwin"
+lxml; sys_platform == "darwin"
