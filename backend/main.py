@@ -156,7 +156,11 @@ def download_media(req: DownloadRequest):
             raise _DownloadCanceled("Download canceled by user")
 
     ydl_opts = {
-        'outtmpl': os.path.join(downloads_path, '%(title).200s.%(ext)s'),
+        'outtmpl': '%(title).200s.%(ext)s',
+        'paths': {
+            'home': downloads_path,
+            'temp': downloads_path,
+        },
         'quiet': False,
         'ffmpeg_location': _get_ffmpeg_path(),
         'windowsfilenames': _IS_WINDOWS,
