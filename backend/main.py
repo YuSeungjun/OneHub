@@ -163,6 +163,7 @@ def download_media(req: DownloadRequest):
         'restrictfilenames': True,
         'trim_file_name': 200,
         'progress_hooks': [cancel_hook],
+        'concurrent_fragment_downloads': 4,
     }
 
     if req.format == 'mp3':
@@ -182,18 +183,28 @@ def download_media(req: DownloadRequest):
             f'best[ext=mp4]/best'
         )
         ydl_opts['merge_output_format'] = 'mp4'
-        # QuickTime 호환: H.264+AAC로 재인코딩 보장
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }]
-        ydl_opts['postprocessor_args'] = {
-            'videoconvertor': [
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '192k',
-                '-movflags', '+faststart',
-            ],
-        }
+        if _IS_WINDOWS:
+            # Windows: 리먹싱만 수행 (재인코딩 없음, 수 초 내 완료)
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegVideoRemuxer',
+                'preferedformat': 'mp4',
+            }]
+            ydl_opts['postprocessor_args'] = {
+                'videoremuxer': ['-movflags', '+faststart'],
+            }
+        else:
+            # macOS: QuickTime 호환을 위해 H.264+AAC로 재인코딩
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }]
+            ydl_opts['postprocessor_args'] = {
+                'videoconvertor': [
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-c:a', 'aac', '-b:a', '192k',
+                    '-movflags', '+faststart',
+                ],
+            }
 
     result_q = queue.Queue()
     dl_thread = threading.Thread(target=_run_download, args=(ydl_opts, req.url, result_q), daemon=True)
