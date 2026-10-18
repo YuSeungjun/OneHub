@@ -1,253 +1,215 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Youtube, FileText, Globe } from 'lucide-react';
-import MediaHub from './components/MediaHub';
-import DocHub from './components/DocHub';
-import { translations } from './locales';
-import './index.css';
+import { useEffect, useRef, useState } from "react";
+import { Globe, Youtube } from "lucide-react";
+import MediaHub from "./components/MediaHub";
+import DownloadProgress from "./components/DownloadProgress";
+import { prepareCompletionSound, playCompletionSound } from "./completionSound";
+import { translations } from "./locales";
 
-function App() {
-  const [activeMode, setActiveMode] = useState('media'); // 'media' or 'doc'
-  const [lang, setLang] = useState('ko');
-  const [platform] = useState(() => window.electronAPI?.platform || 'win32');
+const activeStates = new Set([
+  "starting",
+  "downloading",
+  "processing",
+  "retrying",
+  "canceling",
+]);
+
+async function requestApi(config, route, body) {
+  const response = await fetch(`${config.url}${route}`, {
+    method: body === undefined ? "GET" : "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(config.token ? { "X-OneHub-Token": config.token } : {}),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const detail = Array.isArray(data.detail)
+      ? data.detail.map((item) => item.msg).join(" ")
+      : data.detail;
+    throw new Error(data.message || detail || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+export default function App() {
+  const [lang, setLang] = useState("ko");
+  const [config, setConfig] = useState(null);
+  const [downloadPath, setDownloadPath] = useState("");
+  const [job, setJob] = useState({ status: "ready", progress: 0 });
+  const [connectionError, setConnectionError] = useState(false);
+  const submitting = useRef(false);
+  const notifiedJob = useRef(null);
+  const progressPanel = useRef(null);
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    try {
+      return localStorage.getItem("onehub-completion-sound") !== "off";
+    } catch {
+      return true;
+    }
+  });
   const t = translations[lang];
-  const [status, setStatus] = useState(t.ready);
-  const [progress, setProgress] = useState(0);
-  const [downloadPath, setDownloadPath] = useState('');
-  const isProcessing = progress > 0 && progress < 100;
-  const abortControllerRef = useRef(null);
-  const cancelledRef = useRef(false);
+  const isProcessing = activeStates.has(job.status);
 
   useEffect(() => {
-    if (status === translations[lang === 'ko' ? 'en' : 'ko'].ready) {
-      setStatus(t.ready);
-    }
+    let mounted = true;
+    Promise.all([
+      window.electronAPI?.getBackendConfig() || {
+        url: "http://127.0.0.1:8000",
+        token: "",
+      },
+      window.electronAPI?.getDefaultDownloadPath() || "",
+    ])
+      .then(([backend, folder]) => {
+        if (mounted) {
+          setConfig(backend);
+          setDownloadPath(folder);
+        }
+      })
+      .catch(() => {
+        if (mounted) setConnectionError(true);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = lang;
   }, [lang]);
 
   useEffect(() => {
-    const initPath = async () => {
-      if (window.electronAPI && window.electronAPI.getDefaultDownloadPath) {
-        const p = await window.electronAPI.getDefaultDownloadPath();
-        if (p) setDownloadPath(p);
-      }
-    };
-    initPath();
-  }, []);
-
-  // 백엔드가 아직 안 떴으면 자동 재시도 (최대 15초)
-  const fetchWithRetry = async (url, options, retries = 10) => {
-    for (let i = 0; i < retries; i++) {
-      try {
-        return await fetch(url, options);
-      } catch (err) {
-        if (err.name === 'AbortError') throw err;
-        if (i === retries - 1) throw err;
-        await new Promise(r => setTimeout(r, 1500));
-      }
-    }
-  };
-
-  const handleCancel = async () => {
-    cancelledRef.current = true;
-    // 1. 프론트엔드 fetch 요청 중단
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    // 2. 백엔드에 취소 신호 전송 (yt-dlp 프로세스 종료 + 부분 파일 삭제)
-    try {
-      await fetch('http://127.0.0.1:8000/media/cancel', { method: 'POST' });
-    } catch (_) { /* 무시 */ }
-    setProgress(0);
-    setStatus(t.canceled);
-  };
-
-  const toggleMode = () => {
-    if (isProcessing) {
-      alert(lang === 'ko' ? '현재 작업이 진행 중입니다. 잠시 후 시도해주세요.' : 'Task is currently processing. Please try again later.');
+    if (job.status !== "success" || !job.id || notifiedJob.current === job.id)
       return;
-    }
-    setActiveMode(prev => prev === 'media' ? 'doc' : 'media');
-  };
+    notifiedJob.current = job.id;
+    if (soundEnabled) void playCompletionSound().catch(() => {});
+  }, [job.id, job.status, soundEnabled]);
 
-  const handleMediaDownload = async (url, format, resolution) => {
-    cancelledRef.current = false;
-    setStatus(`${t.extracting.replace('{format}', format.toUpperCase())} ${t.fromYoutube}`);
-    setProgress(15);
-    if (abortControllerRef.current) abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
-
+  function toggleSound() {
+    const enabled = !soundEnabled;
+    setSoundEnabled(enabled);
     try {
-      const response = await fetchWithRetry('http://127.0.0.1:8000/media/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, format, resolution, download_path: downloadPath }),
-        signal: abortControllerRef.current.signal
-      });
-      if (cancelledRef.current) return;
-      const data = await response.json();
-      if (cancelledRef.current) return;
-      if (response.ok && data.status === 'success') {
-        setProgress(100);
-        setStatus(t.extractionComplete);
-      } else if (data.status === 'canceled') {
-        setStatus(t.canceled);
-        setProgress(0);
-      } else {
-        const errorMsg = data.message || (data.detail ? JSON.stringify(data.detail) : 'Unknown error');
-        setStatus(`${t.error}: ${errorMsg}`);
-        setProgress(0);
-      }
-    } catch (err) {
-      if (cancelledRef.current) return;
-      if (err.name === 'AbortError') {
-        setStatus(t.canceled);
-      } else {
-        setStatus(t.backendError);
-      }
-      setProgress(0);
+      localStorage.setItem("onehub-completion-sound", enabled ? "on" : "off");
+    } catch {
+      /* The setting still works for this session. */
     }
-    setTimeout(() => { if (progress === 100) setProgress(0); }, 3000);
-  };
+    if (enabled) void prepareCompletionSound();
+  }
 
-  const handleDocConvert = async (file, direction) => {
-    const dirText = direction === 'HWP_TO_WORD' ? 'Word' : 'HWP';
-    setStatus(`${t.converting.replace('{file}', file.name)} ${dirText} ${t.to}`);
-    setProgress(20);
-    if (abortControllerRef.current) abortControllerRef.current.abort();
-    abortControllerRef.current = new AbortController();
+  useEffect(() => {
+    if (!config || !job.id || !isProcessing) return;
+    let stopped = false;
+    let timer;
+    async function poll() {
+      try {
+        const next = await requestApi(config, `/media/status/${job.id}`);
+        if (!stopped) {
+          setJob(next);
+          setConnectionError(false);
+        }
+      } catch {
+        // Retain the active job during temporary connection failures.
+        if (!stopped) setConnectionError(true);
+      }
+      if (!stopped) timer = setTimeout(poll, 700);
+    }
+    timer = setTimeout(poll, 200);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [config, job.id, isProcessing]);
 
+  async function download(url, format, resolution) {
+    if (!config || submitting.current || isProcessing) return;
+    submitting.current = true;
+    progressPanel.current?.scrollIntoView({
+      block: "start",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "instant"
+        : "smooth",
+    });
+    if (soundEnabled) void prepareCompletionSound();
+    setConnectionError(false);
+    setJob({ status: "starting", progress: null });
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('direction', direction);
-      formData.append('save_path', downloadPath || '');
-
-      const response = await fetchWithRetry('http://127.0.0.1:8000/doc/convert', {
-        method: 'POST',
-        body: formData,
-        signal: abortControllerRef.current.signal
-      });
-      const data = await response.json();
-      if (response.ok && data.status === 'success') {
-        setProgress(100);
-        setStatus(t.conversionComplete);
-      } else {
-        const errorMsg = data.message || (data.detail ? JSON.stringify(data.detail) : 'Unknown error');
-        setStatus(`${t.error}: ${errorMsg}`);
-        setProgress(0);
-      }
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        setStatus(t.canceled);
-      } else {
-        setStatus(t.backendError);
-      }
-      setProgress(0);
+      setJob(
+        await requestApi(config, "/media/download", {
+          url: url.trim(),
+          format,
+          resolution,
+          download_path: downloadPath,
+        }),
+      );
+    } catch (error) {
+      setJob({ status: "error", progress: 0, message: error.message });
+    } finally {
+      submitting.current = false;
     }
-    setTimeout(() => { if (progress === 100) setProgress(0); }, 3000);
-  };
+  }
+
+  async function cancel() {
+    if (!job.id || job.status === "canceling") return;
+    try {
+      setJob(await requestApi(config, `/media/cancel/${job.id}`, {}));
+    } catch {
+      setConnectionError(true);
+    }
+  }
+
+  async function selectPath() {
+    try {
+      const folder = await window.electronAPI?.selectFolder();
+      if (folder) setDownloadPath(folder);
+    } catch (error) {
+      setJob({ status: "error", progress: 0, message: error.message });
+    }
+  }
 
   return (
     <div className="app-container">
-      {/* Language Toggle */}
-      <div style={{ position: 'absolute', top: '2rem', left: '2rem', zIndex: 100 }}>
+      <header className="app-header">
+        <span className="brand">
+          OneHub <span>YouTube</span>
+        </span>
         <button
-          onClick={() => setLang(lang === 'ko' ? 'en' : 'ko')}
-          style={{
-            display: 'flex', alignItems: 'center', gap: '8px',
-            background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)',
-            padding: '8px 16px', borderRadius: '20px', color: 'white',
-            cursor: 'pointer', fontWeight: '500', transition: 'all 0.3s'
-          }}
-          onMouseOver={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.2)'}
-          onMouseOut={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.1)'}
+          className="language-button"
+          onClick={() => setLang(lang === "ko" ? "en" : "ko")}
         >
-          <Globe size={18} />
-          {lang === 'ko' ? 'English' : '한국어'}
+          <Globe size={16} />
+          {lang === "ko" ? "English" : "한국어"}
         </button>
-      </div>
-
-      <div className="glass-panel main-content">
-
-        {/* Media Hub Section */}
-        <div className={`hub-section media-hub ${activeMode === 'media' ? 'active' : ''}`}>
-          <div className="hub-header">
-            <h1 className="hub-title">
-              <Youtube style={{ display: 'inline-block', marginRight: '8px', verticalAlign: 'middle' }} size={36} />
-              {t.mediaHubTitle}
-            </h1>
-            <p className="hub-subtitle">{t.mediaHubSub}</p>
+      </header>
+      <DownloadProgress
+        panelRef={progressPanel}
+        job={job}
+        t={t}
+        connectionError={connectionError}
+        isProcessing={isProcessing}
+        soundEnabled={soundEnabled}
+        onToggleSound={toggleSound}
+      />
+      <main className="glass-panel main-content">
+        <div className="hub-header">
+          <div className="youtube-icon">
+            <Youtube size={32} />
           </div>
-          <MediaHub
-            onDownload={handleMediaDownload}
-            t={t}
-            downloadPath={downloadPath}
-            isProcessing={activeMode === 'media' && isProcessing}
-            onCancel={handleCancel}
-            onSelectPath={async () => {
-              if (window.electronAPI && window.electronAPI.selectFolder) {
-                const folderPath = await window.electronAPI.selectFolder();
-                if (folderPath) setDownloadPath(folderPath);
-              }
-            }}
-          />
+          <h1>{t.mediaHubTitle}</h1>
+          <p>{t.mediaHubSub}</p>
         </div>
-
-        {/* Central Toggle */}
-        <div className="toggle-container">
-          <div
-            className={`toggle-switch ${activeMode}`}
-            onClick={toggleMode}
-            title={`Switch to ${activeMode === 'media' ? 'Doc Hub' : 'Media Hub'}`}
-          >
-            <div className="toggle-thumb">
-              {activeMode === 'media' ? <Youtube size={20} /> : <FileText size={20} />}
-            </div>
-          </div>
-        </div>
-
-        {/* Doc Hub Section */}
-        <div className={`hub-section doc-hub ${activeMode === 'doc' ? 'active' : ''}`}>
-          <div className="hub-header">
-            <h1 className="hub-title">
-              <FileText style={{ display: 'inline-block', marginRight: '8px', verticalAlign: 'middle' }} size={32} />
-              {t.docHubTitle}
-            </h1>
-            <p className="hub-subtitle">{platform === 'darwin' ? t.docHubSubMac : t.docHubSub}</p>
-          </div>
-          <DocHub
-            onConvert={handleDocConvert}
-            t={t}
-            downloadPath={downloadPath}
-            isProcessing={activeMode === 'doc' && isProcessing}
-            onCancel={handleCancel}
-            platform={platform}
-            onSelectPath={async () => {
-              if (window.electronAPI && window.electronAPI.selectFolder) {
-                const folderPath = await window.electronAPI.selectFolder();
-                if (folderPath) setDownloadPath(folderPath);
-              }
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Global Status Bar */}
-      <div className="glass-panel status-bar">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{
-            width: '12px', height: '12px', borderRadius: '50%',
-            backgroundColor: progress > 0 && progress < 100 ? '#facc15' : '#4ade80'
-          }}></div>
-          <span className="status-text">{status}</span>
-        </div>
-        <div className="progress-container">
-          <div className="progress-fill" style={{ width: `${progress}%` }}></div>
-        </div>
-        {progress > 0 && <span style={{ fontSize: '0.875rem', fontWeight: '500', marginLeft: '1rem' }}>{progress}%</span>}
-      </div>
+        <MediaHub
+          t={t}
+          onDownload={download}
+          downloadPath={downloadPath}
+          onSelectPath={selectPath}
+          canSelectPath={Boolean(window.electronAPI?.selectFolder)}
+          isProcessing={isProcessing}
+          canDownload={Boolean(config)}
+          onCancel={cancel}
+          canCancel={Boolean(job.id) && job.status !== "canceling"}
+        />
+      </main>
     </div>
   );
 }
-
-export default App;

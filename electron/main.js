@@ -1,252 +1,198 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
-const path = require('path');
-const fs = require('fs');
-const { spawn, execFile, execFileSync } = require('child_process');
-const net = require('net');
+const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const path = require("node:path");
+const fs = require("node:fs");
+const { randomBytes } = require("node:crypto");
+const { spawn, execFileSync } = require("node:child_process");
+const { waitForBackendPort, startupErrorMessage } = require("./backend-startup");
 
-let logFile = null;
-function _ensureLogFile() {
-    if (!logFile) {
-        try { logFile = path.join(app.getPath('userData'), 'onehub_debug.log'); } catch (_) {}
-    }
-}
-function log(msg) {
-    const line = `[${new Date().toISOString()}] ${msg}\n`;
-    _ensureLogFile();
-    if (logFile) {
-        try { fs.appendFileSync(logFile, line); } catch (_) {}
-    }
-    try { process.stdout.write(line); } catch (_) {}
-}
+const isWindows = process.platform === "win32";
+let backend;
+let backendConfig;
+let quitting = false;
 
-// 앱 중복 실행 방지 — 이미 실행 중이면 기존 창을 포커스
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-    app.quit();
+function log(message) {
+  try {
+    fs.appendFileSync(
+      path.join(app.getPath("userData"), "onehub_debug.log"),
+      `${new Date().toISOString()} ${message}\n`,
+    );
+  } catch (error) {
+    console.error(error);
+  }
 }
 
-let pythonProcess = null;
-let backendStopping = false;  // 앱 종료 중 재시작 방지
-
-const BACKEND_PORT = 8000;
-const isWin = process.platform === 'win32';
-
-function killProcess(name) {
+async function startBackend() {
+  const startedAt = Date.now();
+  const root = path.join(__dirname, "..");
+  const command = app.isPackaged
+    ? path.join(
+        process.resourcesPath,
+        "backend",
+        isWindows ? "onehub_backend.exe" : "onehub_backend",
+      )
+    : path.join(root, ".venv", isWindows ? "Scripts/python.exe" : "bin/python");
+  const node = app.isPackaged
+    ? path.join(
+        process.resourcesPath,
+        "runtime",
+        isWindows ? "node.exe" : "node",
+      )
+    : process.env.npm_node_execpath;
+  fs.mkdirSync(app.getPath("userData"), { recursive: true });
+  log(`Starting OneHub ${app.getVersion()}: packaged=${app.isPackaged}, backend=${command}`);
+  if (!fs.existsSync(command))
+    throw new Error("다운로드 서비스 실행 파일을 찾을 수 없습니다.");
+  if (app.isPackaged && !fs.existsSync(node))
+    throw new Error("유튜브 다운로드에 필요한 런타임 파일을 찾을 수 없습니다.");
+  const token = randomBytes(32).toString("hex");
+  backend = spawn(
+    command,
+    app.isPackaged ? [] : [path.join(root, "backend/main.py")],
+    {
+      cwd: app.isPackaged ? app.getPath("userData") : root,
+      windowsHide: true,
+      detached: !isWindows,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        PYTHONUTF8: "1",
+        PYTHONUNBUFFERED: "1",
+        ONEHUB_PORT: "0",
+        ONEHUB_API_TOKEN: token,
+        ...(node ? { ONEHUB_NODE_PATH: node } : {}),
+      },
+    },
+  );
+  log(`Backend process: pid=${backend.pid}`);
+  backend.once("exit", (code, signal) => {
+    log(`Backend exited: code=${code}, signal=${signal}`);
+    if (!quitting && backendConfig)
+      dialog.showErrorBox(
+        "OneHub",
+        "다운로드 서비스가 종료되었습니다. 앱을 다시 실행해 주세요.",
+      );
+  });
+  backend.stderr.on("data", (data) => log(data.toString()));
+  const url = await waitForBackendPort(backend, { log });
+  backend.stdout.on("data", (data) => log(data.toString()));
+  backend.stdout.resume();
+  log(`Backend port ready after ${Date.now() - startedAt} ms: ${url}`);
+  for (let attempt = 0; attempt < 60; attempt++) {
     try {
-        if (isWin) {
-            const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
-            execFileSync(taskkillPath, ['/F', '/IM', name], { stdio: 'ignore' });
-        } else {
-            execFileSync('pkill', ['-f', name], { stdio: 'ignore' });
-        }
-    } catch (_) {}
-}
-
-/** 포트 8000을 점유 중인 프로세스를 찾아서 죽인다 */
-function killPortHolder(port) {
-    try {
-        if (isWin) {
-            const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
-            const result = execFileSync('netstat', ['-ano'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
-            const lines = result.split('\n');
-            const pids = new Set();
-            for (const line of lines) {
-                if (line.includes(`:${port}`) && line.includes('LISTENING')) {
-                    const parts = line.trim().split(/\s+/);
-                    const pid = parts[parts.length - 1];
-                    if (pid && pid !== '0') pids.add(pid);
-                }
-            }
-            for (const pid of pids) {
-                log(`Killing PID ${pid} holding port ${port}`);
-                try {
-                    execFileSync(taskkillPath, ['/F', '/T', '/PID', pid], { stdio: 'ignore' });
-                } catch (_) {}
-            }
-        } else {
-            const result = execFileSync('lsof', ['-ti', `:${port}`], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
-            const pids = result.trim().split('\n').filter(Boolean);
-            for (const pid of pids) {
-                log(`Killing PID ${pid} holding port ${port}`);
-                try { process.kill(Number(pid), 'SIGKILL'); } catch (_) {}
-            }
-        }
-    } catch (e) {
-        log(`killPortHolder error: ${e.message}`);
+      const response = await fetch(url, {
+        headers: { "X-OneHub-Token": token },
+        signal: AbortSignal.timeout(1000),
+      });
+      if (response.ok && (await response.json()).app === "onehub") {
+        log(`Backend healthy after ${Date.now() - startedAt} ms`);
+        return { url, token };
+      }
+    } catch {
+      /* uvicorn is still starting. */
     }
+    if (backend.exitCode !== null)
+      throw new Error("백엔드를 시작하지 못했습니다.");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("다운로드 서비스에 연결하지 못했습니다.");
 }
-
-/** 포트가 열려있는지 확인 (백엔드가 살아있는지 헬스체크) */
-function isPortOpen(port) {
-    return new Promise((resolve) => {
-        const sock = new net.Socket();
-        sock.setTimeout(1000);
-        sock.once('connect', () => { sock.destroy(); resolve(true); });
-        sock.once('timeout', () => { sock.destroy(); resolve(false); });
-        sock.once('error', () => { sock.destroy(); resolve(false); });
-        sock.connect(port, '127.0.0.1');
-    });
-}
-
-function startPythonBackend() {
-    if (backendStopping) return;
-
-    let command;
-    let args;
-    let cwd;
-    let useShell = false;
-
-    // 이전 백엔드가 남아있으면 확실히 죽이고 시작
-    const binaryName = isWin ? 'onehub_backend.exe' : 'onehub_backend';
-    killProcess(binaryName);
-    killPortHolder(BACKEND_PORT);
-
-    if (app.isPackaged) {
-        command = path.join(process.resourcesPath, 'backend', binaryName);
-        args = [];
-        cwd = app.getPath('userData');
-        useShell = false;
-    } else {
-        const projectRoot = path.join(__dirname, '..');
-        command = isWin ? 'uv.cmd' : 'uv';
-        args = ['run', 'python', path.join(projectRoot, 'backend', 'main.py')];
-        cwd = projectRoot;
-        useShell = isWin;  // Windows: .cmd 파일은 shell 필요, macOS: 불필요
-    }
-
-    // cwd가 없으면 생성
-    try { fs.mkdirSync(cwd, { recursive: true }); } catch (_) {}
-
-    log(`Spawning backend: command=${command} args=${JSON.stringify(args)} cwd=${cwd} shell=${useShell}`);
-    log(`Command exists: ${fs.existsSync(command)}`);
-
-    const spawnOpts = {
-        cwd: cwd,
-        stdio: ['pipe', 'pipe', 'pipe'],
-    };
-    if (useShell) {
-        spawnOpts.shell = isWin
-            ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
-            : true;
-    }
-
-    pythonProcess = spawn(command, args, spawnOpts);
-
-    pythonProcess.stdout.on('data', (data) => {
-        log(`stdout: ${data}`);
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-        log(`stderr: ${data}`);
-    });
-
-    pythonProcess.on('error', (err) => {
-        log(`Spawn error: ${err.message}`);
-    });
-
-    pythonProcess.on('exit', (code, signal) => {
-        log(`Backend exited: code=${code} signal=${signal}`);
-        pythonProcess = null;
-        // 비정상 종료 시 자동 재시작 (최대 3회)
-        if (!backendStopping && code !== 0) {
-            backendRetries = (backendRetries || 0) + 1;
-            if (backendRetries <= 3) {
-                log(`Auto-restarting backend (attempt ${backendRetries}/3) in 2s...`);
-                setTimeout(() => startPythonBackend(), 2000);
-            } else {
-                log(`Backend failed ${backendRetries} times, giving up.`);
-            }
-        }
-    });
-
-    // 재시작 카운터는 성공적으로 서버가 뜨면 리셋
-    const healthCheck = setInterval(async () => {
-        if (backendStopping || !pythonProcess) {
-            clearInterval(healthCheck);
-            return;
-        }
-        const alive = await isPortOpen(BACKEND_PORT);
-        if (alive) {
-            backendRetries = 0;  // 서버가 정상 동작 — 재시작 카운터 리셋
-            clearInterval(healthCheck);
-            log('Backend health check passed — server is listening.');
-        }
-    }, 2000);
-}
-
-let backendRetries = 0;
 
 function createWindow() {
-    const win = new BrowserWindow({
-        width: 1100,
-        height: 750,
-        autoHideMenuBar: true,
-        webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
-            nodeIntegration: false,
-            contextIsolation: true
-        }
-    });
-
-    if (!app.isPackaged) {
-        win.loadURL('http://localhost:5173');
-    } else {
-        win.loadFile(path.join(process.resourcesPath, 'renderer', 'index.html'));
-    }
+  const win = new BrowserWindow({
+    title: "OneHub · YouTube",
+    width: 920,
+    height: 820,
+    minWidth: 540,
+    minHeight: 680,
+    autoHideMenuBar: true,
+    backgroundColor: "#0f172a",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
+  });
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event) => event.preventDefault());
+  if (app.isPackaged)
+    win.loadFile(path.join(process.resourcesPath, "renderer/index.html"));
+  else win.loadURL("http://localhost:5173");
 }
 
-app.whenReady().then(() => {
-    ipcMain.handle('dialog:selectFolder', async () => {
-        const result = await dialog.showOpenDialog({
-            properties: ['openDirectory']
-        });
-        if (result.canceled) {
-            return null;
-        } else {
-            return result.filePaths[0];
-        }
+if (!app.requestSingleInstanceLock()) app.quit();
+else {
+  app.on("second-instance", () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    }
+  });
+  app.whenReady().then(async () => {
+    ipcMain.handle("backend:config", () => backendConfig);
+    ipcMain.handle("dialog:getDefaultDownloadPath", () =>
+      app.getPath("downloads"),
+    );
+    ipcMain.handle("dialog:selectFolder", async () => {
+      const result = await dialog.showOpenDialog({
+        properties: ["openDirectory", "createDirectory"],
+      });
+      return result.canceled ? null : result.filePaths[0];
     });
-
-    ipcMain.handle('dialog:getDefaultDownloadPath', () => {
-        return app.getPath('downloads');
+    try {
+      backendConfig = await startBackend();
+      createWindow();
+    } catch (error) {
+      log(error.stack || error.message);
+      dialog.showErrorBox(
+        "OneHub 시작 오류",
+        startupErrorMessage(error, {
+          packaged: app.isPackaged,
+          logPath: path.join(app.getPath("userData"), "onehub_debug.log"),
+        }),
+      );
+      app.quit();
+    }
+    app.on("activate", () => {
+      if (backendConfig && !BrowserWindow.getAllWindows().length)
+        createWindow();
     });
+  });
+}
 
-    // 두 번째 인스턴스가 실행되면 기존 창을 포커스
-    app.on('second-instance', () => {
-        const windows = BrowserWindow.getAllWindows();
-        if (windows.length > 0) {
-            if (windows[0].isMinimized()) windows[0].restore();
-            windows[0].focus();
-        }
-    });
-
-    startPythonBackend();
-    createWindow();
-
-    app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
-            createWindow();
-        }
-    });
+app.on("before-quit", (event) => {
+  if (quitting || !backendConfig || backend?.exitCode !== null) return;
+  event.preventDefault();
+  quitting = true;
+  // Cancel the owned job and clean temporary files before stopping the server.
+  fetch(`${backendConfig.url}/shutdown`, {
+    method: "POST",
+    headers: { "X-OneHub-Token": backendConfig.token },
+    signal: AbortSignal.timeout(12000),
+  })
+    .catch((error) => log(`Graceful shutdown: ${error.message}`))
+    .finally(() => app.quit());
 });
 
-app.on('will-quit', () => {
-    backendStopping = true;  // 재시작 방지
-    if (pythonProcess) {
-        if (isWin) {
-            const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
-            try { execFileSync(taskkillPath, ['/F', '/T', '/PID', String(pythonProcess.pid)], { stdio: 'ignore' }); } catch (_) {}
-        } else {
-            pythonProcess.kill('SIGTERM');
-        }
-        const binaryName = isWin ? 'onehub_backend.exe' : 'onehub_backend';
-        killProcess(binaryName);
-        pythonProcess = null;
-    }
+app.on("will-quit", () => {
+  quitting = true;
+  if (!backend?.pid || backend.exitCode !== null) return;
+  try {
+    if (isWindows)
+      execFileSync(
+        path.join(
+          process.env.SystemRoot || "C:\\Windows",
+          "System32/taskkill.exe",
+        ),
+        ["/F", "/T", "/PID", String(backend.pid)],
+        { stdio: "ignore", windowsHide: true },
+      );
+    else process.kill(-backend.pid, "SIGTERM");
+  } catch (error) {
+    log(`Backend shutdown: ${error.message}`);
+  }
 });
-
-app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
-        app.quit();
-    }
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
 });

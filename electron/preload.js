@@ -1,7 +1,9 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld('electronAPI', {
-    selectFolder: () => ipcRenderer.invoke('dialog:selectFolder'),
-    getDefaultDownloadPath: () => ipcRenderer.invoke('dialog:getDefaultDownloadPath'),
-    platform: process.platform
+contextBridge.exposeInMainWorld("electronAPI", {
+  getBackendConfig: () => ipcRenderer.invoke("backend:config"),
+  selectFolder: () => ipcRenderer.invoke("dialog:selectFolder"),
+  getDefaultDownloadPath: () =>
+    ipcRenderer.invoke("dialog:getDefaultDownloadPath"),
+  platform: process.platform,
 });

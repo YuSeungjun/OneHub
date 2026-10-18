@@ -20,6 +20,11 @@ installer
 backend/dist
 *.exe
 *.pyc
+.venv/
+__pycache__/
+.pytest_cache/
+.playwright-cli/
+test-results/
 
 # Editor directories and files
 .vscode/*

@@ -1,27 +1,32 @@
 {
   "name": "onehub",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.1",
+  "description": "OneHub YouTube video and audio downloader",
   "main": "electron/main.js",
   "scripts": {
-    "dev:vite": "vite",
+    "dev:vite": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "dev:electron": "wait-on http://localhost:5173 && electron .",
     "dev": "concurrently \"npm run dev:vite\" \"npm run dev:electron\"",
-    "build:backend": "pyinstaller --noconfirm --distpath ./backend/dist main.spec",
-    "build": "vite build && electron-builder",
+    "build:backend": "uv run --frozen pyinstaller --noconfirm --distpath ./backend/dist main.spec",
+    "build:renderer": "vite build",
+    "build:runtime": "node scripts/prepare-runtime.cjs",
+    "build": "npm run build:backend && npm run build:runtime && npm run build:renderer && electron-builder",
+    "test:backend": "uv run --frozen pytest backend/tests -q",
+    "test:electron": "node --test electron/tests/*.test.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "build": {
     "appId": "com.onehub.app",
     "productName": "OneHub",
+    "electronDist": "node_modules/electron/dist",
     "directories": {
       "output": "installer"
     },
     "asar": true,
     "files": [
-      "electron/main.js",
-      "electron/preload.js",
+      "electron/*.js",
       "package.json",
       "!node_modules/**"
     ],
@@ -30,7 +35,10 @@
       "target": "nsis",
       "icon": "logo/logo.ico",
       "extraResources": [
-        { "from": "dist/onehub_backend.exe", "to": "backend/onehub_backend.exe" }
+        {
+          "from": "backend/dist/onehub_backend",
+          "to": "backend"
+        }
       ]
     },
     "nsis": {
@@ -53,17 +61,32 @@
       "icon": "logo/logo.png",
       "category": "public.app-category.utilities",
       "extraResources": [
-        { "from": "dist/onehub_backend", "to": "backend/onehub_backend" }
+        {
+          "from": "backend/dist/onehub_backend",
+          "to": "backend"
+        }
       ]
     },
     "dmg": {
       "artifactName": "OneHub_Setup.dmg",
       "contents": [
-        { "x": 130, "y": 220 },
-        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     },
     "extraResources": [
+      {
+        "from": "build/runtime",
+        "to": "runtime"
+      },
       {
         "from": "renderer",
         "to": "renderer",
@@ -85,7 +108,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
     "concurrently": "^9.2.1",
-    "electron": "^40.6.1",
+    "electron": "^44.9.0",
     "electron-builder": "^26.8.1",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
